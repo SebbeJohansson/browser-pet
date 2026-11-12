@@ -1,17 +1,28 @@
 import { createJevBrain, JevError } from '~/utils/brain/jev'
+import { createLocalBrain } from '~/utils/brain/local'
 import type { Brain } from '~/utils/brain/types'
+import { geminiNanoAvailability, loadGeminiNano } from '~/utils/local/gemini-nano'
+import type { LocalKind, LocalModel } from '~/utils/local/types'
+import { loadWebLLM, webgpuStatus } from '~/utils/local/webllm'
 import * as store from '~/utils/db'
 import type { Memory } from '~/utils/db'
 import { lineFor, thinkWithBrain, thinkWithRules, type Mood, type Plan } from '~/utils/mind'
 import { act, ACTION_INFO, learn, newPet, ownerFeed, ownerPet, ownerPlay, type Outcome, type PetState } from '~/utils/world'
 
-export type BrainMode = 'jev' | 'rules'
+export type BrainMode = 'jev' | 'local' | 'rules'
+export type LocalChoice = 'auto' | LocalKind
 
 interface Settings {
   brain: BrainMode
   rememberKey: boolean
   tickSeconds: number
   running: boolean
+  /** Which in-browser model to load. 'auto' prefers Gemini Nano, then WebLLM. */
+  localModel: LocalChoice
+  /** Load the local model on page open (set after the first successful load). */
+  localAutoLoad: boolean
+  /** Let the local model write the pet's lines. */
+  dialogue: boolean
 }
 
 const SETTINGS_KEY = 'browser-pet.settings'
@@ -43,7 +54,21 @@ const error = ref('')
 const persisted = ref<boolean | null>(null)
 const calls = reactive({ count: 0, inputTokens: 0 })
 const jevKey = ref('')
-const settings = reactive<Settings>({ brain: 'rules', rememberKey: false, tickSeconds: 15, running: true })
+const settings = reactive<Settings>({
+  brain: 'rules', rememberKey: false, tickSeconds: 15, running: true,
+  localModel: 'auto', localAutoLoad: false, dialogue: true,
+})
+
+const local = shallowRef<LocalModel | null>(null)
+const localBrain = shallowRef<Brain | null>(null)
+const localStatus = reactive({
+  geminiNano: 'checking' as string,
+  webgpu: 'checking' as 'checking' | 'yes' | 'software' | 'none',
+  loading: false,
+  progress: 0,
+  text: '',
+  error: '',
+})
 
 let pending: { outcome: Outcome; memory: Memory } | null = null
 let timer: ReturnType<typeof setInterval> | null = null
@@ -53,6 +78,13 @@ const jev: Brain = createJevBrain(() => jevKey.value, (tokens) => {
   calls.count += 1
   calls.inputTokens += tokens
 })
+
+function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms)
+    work.then(resolve, reject).finally(() => clearTimeout(t))
+  })
+}
 
 async function refreshLog() {
   log.value = await store.recentMemories(30)
@@ -70,18 +102,26 @@ async function tick() {
     const memories = await store.recentMemories(8, 'decision')
     const lessons = await store.recentMemories(5, 'lesson')
 
-    let plan: Plan
-    if (settings.brain === 'jev' && jevKey.value) {
+    // Fallback order: Jev (if picked and keyed) → local model (if loaded) → coded rules.
+    const chain: Brain[] = []
+    if (settings.brain === 'jev' && jevKey.value) chain.push(jev)
+    if (settings.brain !== 'rules' && localBrain.value) chain.push(localBrain.value)
+    let plan: Plan | null = null
+    const errors: string[] = []
+    for (const brain of chain) {
       try {
-        plan = await thinkWithBrain(jev, p, pending?.outcome ?? null, memories, lessons)
-        error.value = ''
+        plan = await withTimeout(
+          thinkWithBrain(brain, p, pending?.outcome ?? null, memories, lessons),
+          brain === jev ? 20_000 : 60_000,
+          `${brain.name} took too long`,
+        )
+        break
       } catch (e) {
-        error.value = e instanceof JevError && e.status === 401 ? 'Jev rejected the key (401). Using rules.' : `Jev failed, using rules: ${(e as Error).message}`
-        plan = thinkWithRules(p, pending?.outcome ?? null, memories)
+        errors.push(e instanceof JevError && e.status === 401 ? 'Jev rejected the key (401)' : `${brain.name} failed: ${(e as Error).message}`)
       }
-    } else {
-      plan = thinkWithRules(p, pending?.outcome ?? null, memories)
     }
+    plan ??= thinkWithRules(p, pending?.outcome ?? null, memories)
+    error.value = errors.length ? `${errors.join('; ')}. Used ${plan.source}.` : ''
 
     // 1. Learn from the previous outcome.
     if (pending && plan.judgment !== undefined) {
@@ -116,12 +156,111 @@ async function tick() {
     lastPlan.value = plan
     mood.value = plan.mood
     speech.value = lineFor(outcome)
+    void speak(p, outcome, plan.mood)
 
     await save()
     await refreshLog()
   } finally {
     thinking.value = false
   }
+}
+
+/** Replace the canned line with one from the local model, if it answers before the next tick. */
+async function speak(p: PetState, outcome: Outcome, m: Mood) {
+  const model = local.value
+  if (!model || !settings.dialogue) return
+  const tickAtStart = p.tick
+  try {
+    const raw = await model.generate(
+      `You are ${p.name}, a small, cute virtual pet. You speak in short, playful first-person sentences.`,
+      `You feel ${m}. You just ${outcome.text}. Say one short sentence, at most 12 words, as the pet. Output only the sentence.`,
+    )
+    const line = raw.trim().split('\n')[0]!.replace(/^["']|["']$/g, '').slice(0, 120)
+    if (line && pet.value?.tick === tickAtStart) speech.value = line
+  } catch { /* keep the canned line */ }
+}
+
+async function detectLocal() {
+  const [gpu, nano] = await Promise.all([webgpuStatus(), geminiNanoAvailability()])
+  localStatus.webgpu = gpu
+  localStatus.geminiNano = nano
+  if (nano === 'downloading') watchNanoDownload()
+}
+
+/** Which model 'auto' (or the user's pick) resolves to on this device, or null. */
+// Auto prefers a Gemini Nano that is already on disk, then Qwen (small, quick download),
+// and only then a Gemini Nano that still needs Chrome's multi-GB download.
+function resolveLocal(): LocalKind | null {
+  const nanoReady = localStatus.geminiNano === 'available'
+  const nanoPossible = nanoReady || localStatus.geminiNano === 'downloadable' || localStatus.geminiNano === 'downloading'
+  const gpu = localStatus.webgpu === 'yes'
+  if (settings.localModel === 'gemini-nano') return nanoPossible ? 'gemini-nano' : null
+  if (settings.localModel === 'webllm') return gpu ? 'webllm' : null
+  return nanoReady ? 'gemini-nano' : gpu ? 'webllm' : nanoPossible ? 'gemini-nano' : null
+}
+
+let loadId = 0
+let abortLoad: AbortController | null = null
+
+async function loadLocal() {
+  const kind = resolveLocal()
+  if (!kind || localStatus.loading) return
+  const id = ++loadId
+  abortLoad = new AbortController()
+  localStatus.loading = true
+  localStatus.error = ''
+  localStatus.progress = 0
+  localStatus.text = ''
+  try {
+    const onProgress = (f: number, t: string) => {
+      if (id !== loadId) return
+      localStatus.progress = f
+      localStatus.text = t
+    }
+    const model = kind === 'gemini-nano' ? await loadGeminiNano(onProgress, abortLoad.signal) : await loadWebLLM(onProgress)
+    if (id !== loadId) {
+      // Cancelled while loading: drop it.
+      await model.unload?.()
+      return
+    }
+    local.value = model
+    localBrain.value = createLocalBrain(model)
+    settings.localAutoLoad = true
+  } catch (e) {
+    if (id === loadId) localStatus.error = (e as Error).message
+  } finally {
+    if (id === loadId) localStatus.loading = false
+  }
+}
+
+/** Stop waiting for the current load. A Gemini Nano download may continue inside Chrome. */
+function cancelLocal() {
+  loadId++
+  abortLoad?.abort()
+  localStatus.loading = false
+  localStatus.text = ''
+  settings.localAutoLoad = false
+}
+
+async function unloadLocal() {
+  const model = local.value
+  local.value = null
+  localBrain.value = null
+  settings.localAutoLoad = false
+  await model?.unload?.()
+}
+
+// Chrome downloads Gemini Nano in the background; refresh its status so the menu shows when it is ready.
+let nanoPoll: ReturnType<typeof setInterval> | null = null
+function watchNanoDownload() {
+  if (nanoPoll) return
+  nanoPoll = setInterval(async () => {
+    localStatus.geminiNano = await geminiNanoAvailability()
+    if (localStatus.geminiNano === 'available' || localStatus.geminiNano === 'unavailable') {
+      clearInterval(nanoPoll!)
+      nanoPoll = null
+    }
+  }, 15_000)
 }
 
 function restartTimer() {
@@ -163,6 +302,8 @@ async function start() {
   })
 
   persisted.value = (await navigator.storage?.persist?.()) ?? false
+  await detectLocal()
+  if (settings.localAutoLoad) void loadLocal()
   pet.value = (await store.loadPet()) ?? newPet()
   await save()
   await refreshLog()
@@ -198,6 +339,7 @@ async function reset(name: string) {
 export function usePet() {
   return {
     pet, log, mood, speech, lastPlan, thinking, error, persisted, calls, jevKey, settings,
+    local, localStatus, resolveLocal, loadLocal, cancelLocal, unloadLocal, watchNanoDownload,
     start, tick, owner, exportFile, importFile, reset,
   }
 }

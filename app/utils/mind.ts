@@ -6,7 +6,8 @@ export const MOODS = ['content', 'hungry', 'sleepy', 'bored', 'lonely', 'curious
 export type Mood = (typeof MOODS)[number]
 
 export interface Plan {
-  source: 'Jev' | 'rules'
+  /** Which brain decided: 'rules', 'Jev', or a local model's label. */
+  source: string
   action: Action
   /** Jev's probability for the chosen action, if Jev decided. */
   confidence?: number
@@ -97,7 +98,7 @@ export async function thinkWithBrain(brain: Brain, pet: PetState, pending: Outco
   if (action?.type !== 'choice' || mood?.type !== 'choice') throw new Error('Brain returned unexpected answers')
   if (!ACTIONS.includes(action.choice as Action)) throw new Error(`Unknown action ${action.choice}`)
   return {
-    source: 'Jev',
+    source: brain.name,
     action: action.choice as Action,
     confidence: action.probabilities[action.choice],
     mood: (MOODS as readonly string[]).includes(mood.choice) ? (mood.choice as Mood) : 'content',

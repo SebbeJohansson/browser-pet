@@ -1,10 +1,11 @@
 <script setup lang="ts">
-const { start, settings, jevKey } = usePet()
+const { start, settings, local, jevKey } = usePet()
 onMounted(start)
 
 const menu = ref<HTMLDialogElement>()
 const brainLabel = computed(() => {
   if (settings.brain === 'jev' && jevKey.value) return 'Jev'
+  if (settings.brain !== 'rules' && local.value) return local.value.label
   return 'Coded rules'
 })
 </script>
