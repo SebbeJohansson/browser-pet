@@ -24,7 +24,7 @@ async function onReset() {
 </script>
 
 <template>
-  <section class="card">
+  <div>
     <h2>Brain</h2>
     <label class="row">
       <input v-model="settings.brain" type="radio" value="rules"> Coded rules (free, no key)
@@ -65,7 +65,7 @@ async function onReset() {
       <button class="danger" @click="onReset">Start over</button>
     </div>
     <p v-if="status" class="hint">{{ status }}</p>
-  </section>
+  </div>
 </template>
 
 <style scoped>
